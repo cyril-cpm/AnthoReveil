@@ -18,9 +18,12 @@
 
 #define LIGHT_PIN 21
 
+#define MULTI_PIN 27
 
-//Servo pistolServo;
-FS5113R pistolServo(19);
+#define BURPIES_PIN 35
+
+Servo pistolServo;
+//FS5113R pistolServo(19);
 
 TFT_eSPI tft = TFT_eSPI();  // Créer un objet TFT
 
@@ -427,6 +430,8 @@ public:
     bool* getBoolean() { return _boolValue; }
     void setInt(uint8_t* value) { _intValue = value; }
     uint8_t* getInt() { return _intValue; }
+    void setActionCB(void (*actionCB)(Page* parent, Page** children, int nbChildren)) { _actionCB = actionCB; }
+    void doAction() { _actionCB(_parent, _children, _nbChildren); }
 
 protected:
     Page* _parent = nullptr;
@@ -438,6 +443,7 @@ protected:
     void (*_checkNavigateCB)(Page* parent, Page** children, int nbChildren) = nullptr;
     bool* _boolValue = nullptr;
     uint8_t* _intValue = nullptr;
+    void (*_actionCB)(Page* parent, Page**children, int nbChildren) = nullptr;
 };
 
 Page* currentPage = nullptr;
@@ -497,7 +503,10 @@ void gotoPageCB(Page* parent, Page** children, int nbChildren)
     if (selectedItem < nbChildren)
     {
         if (children[selectedItem]->getBoolean())
+        {
             *(children[selectedItem]->getBoolean()) = !*(children[selectedItem]->getBoolean());
+            children[selectedItem]->doAction();
+        }
         else if (children[selectedItem]->getInt())
             *(children[selectedItem]->getInt()) = (*(children[selectedItem]->getInt()) + 1) % 10;
         else
@@ -720,8 +729,65 @@ void butBInterrupt()
         buttonBFall();
 }
 
+uint8_t servoAngle = 90;
+
+void cbServo()
+{
+    pistolServo.write(servoAngle);
+}
+
+bool multiState = false;
+
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 3600 * 7.5;  // Décalage horaire (ex: GMT+1 = 3600 sec)
+const int   daylightOffset_sec = 3600; // Ajustement heure d'été
+
+
+bool alarmRunning = false;
+ulong pistolServoTS = 0;
+
+int interruptedPin = -1;
+ulong lastInterruptedBurpies = 0;
+
+uint8_t burpiesCount = 0;
+
+void piezzoHandle()
+{
+  if (millis() - lastInterruptedBurpies > 500)
+  {
+    lastInterruptedBurpies = millis();
+    burpiesCount++;
+    Serial.println(burpiesCount);
+  }
+}
+
+void startAlarm()
+{
+    if (!alarmRunning)
+    {
+        alarmRunning = true;
+
+        multiState = true;
+        digitalWrite(MULTI_PIN, HIGH);
+
+        pistolServo.write(110);
+        pistolServoTS = millis();
+    }
+    else
+    {
+        if (burpiesCount >= 15)
+        {
+            pistolServo.write(90);
+            multiState = false;
+            digitalWrite(MULTI_PIN, LOW);
+        }
+    }
+}
+
 void setup() {
   Serial.begin(9600);
+
+  attachInterrupt(BURPIES_PIN, &piezzoHandle, RISING);
 
   pinMode(PIN_A, INPUT_PULLUP);
   pinMode(PIN_B, INPUT_PULLUP);
@@ -736,8 +802,26 @@ void setup() {
   alarmSetting.setCheckNavigate(&noMiddleSelection);
   alarmActivation.setBoolean(&alarmActivated);
   hourWebSynced.setBoolean(&isHourWebSynced);
+  hourWebSynced.setActionCB([](Page*, Page**, int) {
+    struct tm timeinfo;
+
+    if (isHourWebSynced && getLocalTime(&timeinfo)) {
+        Serial.printf("Heure actuelle : %02d:%02d:%02d\n",
+                      timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+        setTime(timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec, timeinfo.tm_yday, timeinfo.tm_mon, timeinfo.tm_year);
+    }
+  });
   lightSetting.setInt(&light);
 
+
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    Serial.println("Synchronisation avec NTP...");
+    
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo)) {
+        Serial.println("Échec de la récupération de l'heure !");
+        //return;
+    }
   tft.init();
   tft.setRotation(3); // Rotation de l'écran pour un affichage orienté (optionnel)
 
@@ -745,36 +829,48 @@ void setup() {
 
   setTime(19, 50, 0, 1, 1, 2025);
 
-  //pistolServo.attach(22);
-  pistolServo.begin();
-  pistolServo.stop();
+  pistolServo.attach(26);
+  //pistolServo.begin();
+  //pistolServo.stop();
+  pistolServo.write(90);
+
+  pinMode(MULTI_PIN, OUTPUT);
 
   loadBackground();
 
   currentPage = &mainMenu;
 
-  Settingator::StartWiFi();
-  //STR.SetCommunicator(WebSocketCTR::CreateSTAInstance("Livebox-83C380", "GTXZ7853"));
-  STR.SetCommunicator(WebSocketCTR::CreateInstance());
+  STR.SetCommunicator(WebSocketCTR::CreateSTAInstance("****", "****"));
+
+  //Settingator::StartWiFi();
+  //STR.SetCommunicator(WebSocketCTR::CreateInstance());
   server = new HTTPServer(8080);
 
-  STR.AddSetting(Setting::Type::Slider, &interpolateVar, sizeof(interpolateVar), "INTERPOLATE");
-  STR.AddSetting(Setting::Type::Slider, &lightningNumber, sizeof(lightningNumber), "Nombre d'éclairs");
-  STR.AddSetting(Setting::Type::Switch, &mode, sizeof(mode), "mode");
+  //STR.AddSetting(Setting::Type::Slider, &interpolateVar, sizeof(interpolateVar), "INTERPOLATE");
+  //STR.AddSetting(Setting::Type::Slider, &lightningNumber, sizeof(lightningNumber), "Nombre d'éclairs");
+  //STR.AddSetting(Setting::Type::Switch, &mode, sizeof(mode), "mode");
   //STR.AddSetting(Setting::Type::Trigger, nullptr, 0, "SHOOT", &shoot);
-  STR.AddSetting(Setting::Type::Trigger, nullptr, 0, "LEFT", [](){ pistolServo.write(-0.05); });
-  STR.AddSetting(Setting::Type::Trigger, nullptr, 0, "RIGHT", [](){ pistolServo.write(0.05);});
-  STR.AddSetting(Setting::Type::Trigger, nullptr, 0, "STOP", [](){ pistolServo.stop();});
+  //STR.AddSetting(Setting::Type::Trigger, nullptr, 0, "LEFT", [](){ pistolServo.write(-0.05); });
+  //STR.AddSetting(Setting::Type::Trigger, nullptr, 0, "RIGHT", [](){ pistolServo.write(0.05);});
+  //STR.AddSetting(Setting::Type::Trigger, nullptr, 0, "STOP", [](){ pistolServo.stop();});
+  //STR.AddSetting(Setting::Type::Slider, &servoAngle, sizeof(servoAngle), "SERVO ANGLE", &cbServo);
 
-  STR.AddSetting(Setting::Type::Trigger, nullptr, 0, "Navigate", [](){menuNavigate();});
-  STR.AddSetting(Setting::Type::Trigger, nullptr, 0, "Return", [](){menuReturn();});
-  STR.AddSetting(Setting::Type::Trigger, nullptr, 0, "Main Menu", [](){menuOpenMainMenu();});
-  STR.AddSetting(Setting::Type::Trigger, nullptr, 0, "Validate", [](){menuValidate();});
-
+  STR.AddSetting(Setting::Type::Trigger, nullptr, 0, "Menu Principal", [](){menuOpenMainMenu();});
+  STR.AddSetting(Setting::Type::Trigger, nullptr, 0, "Suivant", [](){menuNavigate();});
+  STR.AddSetting(Setting::Type::Trigger, nullptr, 0, "Retour", [](){menuReturn();});
+  STR.AddSetting(Setting::Type::Trigger, nullptr, 0, "Valider", [](){menuValidate();});
+  //STR.AddSetting(Setting::Type::Switch, &multiState, sizeof(multiState), "Multi Prise",  [](){digitalWrite(MULTI_PIN, multiState);});
   randomSeed(analogRead(0));
 }
 
 void loop() {
+    struct tm timeinfo;
+    if (isHourWebSynced && getLocalTime(&timeinfo) && (millis() % 300000) < 100) {
+        Serial.printf("Heure actuelle : %02d:%02d:%02d\n",
+                      timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+        setTime(timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec, timeinfo.tm_yday, timeinfo.tm_mon, timeinfo.tm_year);
+    }
+
   drawBackground();
   drawLightning(80, 64, 50, 100, STICK_CENTER);
   currentPage->display();
@@ -784,7 +880,12 @@ void loop() {
   if (millis() - lastActionStamp < 5000 * 60)
     analogWrite(LIGHT_PIN, (light + 1) * 25);
   else
-    analogWrite(LIGHT_PIN, 0);
+    analogWrite(LIGHT_PIN, 250);
+
+  if (hour() == alarmHour && minute() == alarmMinute)
+  {
+    startAlarm();
+  }
 
   delay(5);  // Petit délai avant de redessiner
   interpolateVar++;
